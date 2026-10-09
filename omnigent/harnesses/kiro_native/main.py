@@ -196,7 +196,14 @@ def build_kiro_launch(
 ) -> NativeKiroLaunch:
     """Build the argv for a native Kiro TUI process."""
     executable = resolve_kiro_executable(env=env, which=which)
-    argv = [executable, "chat", "--tui"]
+    # CUSTOM PATCH (set5think fork) — host-launched Kiro runs unattended (the
+    # user drives it from the web UI, not a TTY), so it must not block on
+    # per-tool approval prompts. `--trust-all-tools` makes kiro-cli auto-trust
+    # tools; paired with the `chat.disableTrustAllConfirmation=true` kiro-cli
+    # setting it also skips the one-time consent screen. Without this the TUI
+    # stops and waits for a permission verdict that never comes in headless use.
+    # See the omnigent-fork skill manifest (restores a pre-fork customization).
+    argv = [executable, "chat", "--tui", "--trust-all-tools"]
     if resume_id:
         argv.extend(["--resume-id", resume_id])
     if model:
