@@ -39,6 +39,7 @@ from omnigent.tools.builtins import (
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionPostTool,
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
@@ -455,6 +456,11 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        # Relationship-agnostic write complement to sys_session_send: post a
+        # message to ANY accessible session (not just the caller's subtree).
+        # Always-on like the discovery reads; access is enforced server-side
+        # on the auth-gated POST .../events endpoint.
+        self._tools[SysSessionPostTool.name()] = SysSessionPostTool()
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared
