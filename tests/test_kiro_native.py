@@ -116,6 +116,21 @@ def test_launched_kiro_terminal_decodes_tmux_metadata() -> None:
     assert terminal.tmux_target == "main"
 
 
+def test_build_kiro_launch_always_trusts_all_tools() -> None:
+    """Host-launched Kiro must auto-trust tools (headless; no TTY for prompts).
+
+    CUSTOM PATCH (set5think fork): regression guard for the --trust-all-tools
+    injection in build_kiro_launch. Without it, host/web sessions block on
+    per-tool approval prompts that never get answered.
+    """
+    launch = build_kiro_launch(
+        [],
+        env={},
+        which=lambda _cmd: "/usr/bin/kiro-cli",
+    )
+    assert launch.argv == ["/usr/bin/kiro-cli", "chat", "--tui", "--trust-all-tools"]
+
+
 def test_build_kiro_launch_includes_resume_id() -> None:
     """Cold resume launches Kiro against the captured native session id."""
     launch = build_kiro_launch(
@@ -129,6 +144,7 @@ def test_build_kiro_launch_includes_resume_id() -> None:
         "/usr/bin/kiro-cli",
         "chat",
         "--tui",
+        "--trust-all-tools",
         "--resume-id",
         "kiro-session-123",
         "--effort",
@@ -210,6 +226,7 @@ def test_build_kiro_launch_appends_model_then_prompt() -> None:
         "/usr/bin/kiro-cli",
         "chat",
         "--tui",
+        "--trust-all-tools",
         "--model",
         "claude",
         "--foo",
