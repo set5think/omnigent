@@ -62,6 +62,7 @@ from omnigent.tools.builtins.spawn import (
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionPostTool,
     SysSessionSendTool,
     SysSessionShareTool,
 )
@@ -97,6 +98,7 @@ __all__ = [
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
     "SysSessionListTool",
+    "SysSessionPostTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",

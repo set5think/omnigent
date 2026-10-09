@@ -305,6 +305,14 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
+# Priority 5f.1: Relationship-agnostic session write. sys_session_post delivers
+# a user message to ANY accessible session (unlike sys_session_send, which is
+# confined to the caller's spawn subtree). Runner has no in-process
+# ConversationStore, so it posts via the Omnigent server's auth-gated
+# POST /v1/sessions/{id}/events endpoint over server_client — same channel and
+# security posture as _SESSION_QUERY_TOOLS.
+_SESSION_WRITE_TOOLS = frozenset({"sys_session_post"})
+
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
@@ -458,6 +466,7 @@ _BROWSER_TIMEOUT_ERROR = (
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_WRITE_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
@@ -547,6 +556,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         SysSessionGetHistoryTool,
         SysSessionGetInfoTool,
         SysSessionListTool,
+        SysSessionPostTool,
     )
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
@@ -585,6 +595,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
+            SysSessionPostTool,
             SysSessionRenameTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -891,6 +902,7 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_WRITE_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
@@ -6104,6 +6116,73 @@ async def _session_get_history_via_rest(
     )
 
 
+async def _session_post_via_rest(
+    arguments: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Post a user message to any accessible session via ``POST .../events``.
+
+    The runner-side implementation of ``sys_session_post`` — the
+    relationship-agnostic write complement to ``sys_session_send``. Unlike
+    the child-only ``_send_to_existing_session``, this performs NO parentage
+    check and registers no sub-agent work mapping or inbox fan-out: it just
+    delivers the message and lets the target's turn run. Access is whatever
+    the server already enforces on ``POST /v1/sessions/{id}/events`` for
+    ``server_client`` — the same global, auth-gated posture as
+    ``_session_get_history_via_rest``.
+
+    Maps a 404 to ``session_not_found`` and a 401/403 to
+    ``session_out_of_tree`` (the server denied the write).
+
+    :param arguments: JSON-encoded tool args; requires ``conversation_id``
+        and ``message``.
+    :param server_client: HTTP client pointed at the Omnigent server;
+        ``None`` returns an error.
+    :returns: JSON ``{"posted": true, "conversation_id": ...}`` on success;
+        a JSON error object otherwise.
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_session_post requires server access"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": "sys_session_post: malformed JSON arguments"})
+    target_id = args.get("conversation_id")
+    if not isinstance(target_id, str) or not target_id:
+        return json.dumps(
+            {"error": "sys_session_post requires a non-empty 'conversation_id' string"}
+        )
+    message = args.get("message")
+    if not isinstance(message, str) or not message:
+        return json.dumps({"error": "sys_session_post requires a non-empty 'message' string"})
+    payload = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": message}]},
+    }
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{target_id}/events",
+            json=payload,
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_post failed: {exc}", "conversation_id": target_id})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "conversation_id": target_id})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_post returned {resp.status_code}",
+                "conversation_id": target_id,
+                "detail": resp.text[:200],
+            }
+        )
+    return json.dumps({"posted": True, "conversation_id": target_id})
+
+
 async def _fetch_close_target(
     target_id: str,
     server_client: httpx.AsyncClient,
@@ -6484,6 +6563,8 @@ async def execute_tool(
                 server_client=server_client,
                 agent_spec=agent_spec,
             )
+        elif tool_name in _SESSION_WRITE_TOOLS:
+            output = await _session_post_via_rest(arguments, server_client)
         elif tool_name in _WEB_FETCH_TOOLS:
             output = await _execute_web_fetch_tool(
                 args,

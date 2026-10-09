@@ -1681,6 +1681,153 @@ class SysSessionGetHistoryTool(Tool):
         )
 
 
+class SysSessionPostTool(Tool):
+    """
+    Post a message to ANY accessible session, regardless of relationship.
+
+    The relationship-agnostic complement to ``sys_session_send``.
+    ``sys_session_send`` is confined to the caller's own spawn subtree
+    (child sessions it created); ``sys_session_post`` instead delivers a
+    user message to any session the caller is permitted to reach, so
+    unrelated or sibling sessions can talk to each other.
+
+    A **global write**: on the runner (REST) path it posts to any session
+    the caller may access, bounded by the server's per-user permission
+    model via the auth-gated ``POST /v1/sessions/{id}/events`` endpoint —
+    the same security posture as the global read ``sys_session_get_history``.
+    (The in-process path has no caller identity, so it appends directly to
+    the target conversation it can resolve in the shared store.)
+
+    Unlike ``sys_session_send`` this is fire-and-forget: it does NOT create
+    sub-agent work mappings, inbox fan-out, or completion wake notices. The
+    message simply lands in the target session and drives its next turn.
+    Read the target's reply later with ``sys_session_get_history``.
+
+    Returns ``session_not_found`` when the conversation_id does not exist,
+    or ``session_out_of_tree`` when the server denies the write (the caller
+    may not post to that session).
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_post"``."""
+        return "sys_session_post"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Post a message to ANY session you can access, regardless "
+            "of relationship — the relationship-agnostic complement to "
+            "sys_session_send (which is limited to child sessions you "
+            "created). Global write, bounded by the server's per-user "
+            "permission model (auth-gated POST .../events). Fire-and-forget: "
+            "it delivers the message and drives the target's next turn but "
+            "does NOT register sub-agent work or inbox fan-out — read the "
+            "reply later with sys_session_get_history. Returns "
+            "session_not_found if conversation_id is unknown, or "
+            "session_out_of_tree if the server denies the write."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionPostTool.name(),
+                "description": SysSessionPostTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "conversation_id": {
+                            "type": "string",
+                            "description": (
+                                "The target session's conversation_id. Get "
+                                "this from sys_session_list, sys_agent_list, "
+                                "or a prior sys_session_send handle. Any "
+                                "session you can access — need not be in your "
+                                "spawn tree."
+                            ),
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": (
+                                "The user-input message text to post to the "
+                                "target session."
+                            ),
+                        },
+                    },
+                    "required": ["conversation_id", "message"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        """
+        Post a message to the target session (in-process executor path).
+
+        The runner/native path never reaches this — the runner intercepts
+        ``sys_session_post`` by name and dispatches it to the server's REST
+        ``POST /events`` endpoint. This in-process implementation serves the
+        local executor: it resolves the target conversation in the shared
+        store and appends a user message item (relationship-agnostic — no
+        spawn-tree gate; access for that executor is the whole shared store).
+
+        :param arguments: JSON-encoded arguments, e.g.
+            ``'{"conversation_id": "conv_abc123", "message": "hi"}'``.
+        :param ctx: Server-side execution context.
+        :returns: JSON ``{"posted": true, "conversation_id": ...}`` on
+            success; ``{"error": "...", ...}`` on failure.
+        """
+        from omnigent.entities import MessageData, NewConversationItem
+        from omnigent.runtime import get_conversation_store
+
+        try:
+            args = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError:
+            return json.dumps({"error": "sys_session_post: malformed JSON arguments"})
+        if not isinstance(args, dict):
+            return json.dumps({"error": "sys_session_post: arguments must be a JSON object"})
+        target_id = args.get("conversation_id")
+        if not isinstance(target_id, str) or not target_id:
+            return json.dumps(
+                {"error": "sys_session_post requires a non-empty 'conversation_id' string"}
+            )
+        message = args.get("message")
+        if not isinstance(message, str) or not message:
+            return json.dumps(
+                {"error": "sys_session_post requires a non-empty 'message' string"}
+            )
+        conv_store = get_conversation_store()
+        if conv_store.get_conversation(target_id) is None:
+            return json.dumps({"error": "session_not_found", "conversation_id": target_id})
+        try:
+            conv_store.append(
+                target_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id=target_id,
+                        data=MessageData(
+                            role="user",
+                            content=[{"type": "input_text", "text": message}],
+                        ),
+                    )
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001 - surface as a tool error
+            return json.dumps(
+                {"error": f"sys_session_post failed: {exc}", "conversation_id": target_id}
+            )
+        return json.dumps({"posted": True, "conversation_id": target_id})
+
+
 class SysSessionCloseTool(Tool):
     """
     Tombstone any sibling sub-agent session in the same spawn tree.
