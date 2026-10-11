@@ -65,6 +65,15 @@ interface FilesPanelProps {
   sort: ChangedSort;
   onSortChange: (sort: ChangedSort) => void;
   /**
+   * CUSTOM PATCH (set5think fork): compare-to-base selection, lifted to
+   * AppShell so the FileViewer's diff and this list share one base and it
+   * survives inline↔drawer transitions. null = uncommitted working-tree view.
+   * When omitted, the panel falls back to its own per-conversation state
+   * (keeps it usable standalone, e.g. in stories/tests).
+   */
+  compareBase?: string | null;
+  onCompareBaseChange?: (next: string | null) => void;
+  /**
    * When provided, the panel renders an X close button in the header and
    * fills its parent's height — dropping the rounded card chrome so it can
    * serve as the entire content of a full-screen drawer.
@@ -291,6 +300,8 @@ export function FilesPanel({
   onShowHiddenChange,
   sort: changedSort,
   onSortChange,
+  compareBase: compareBaseProp,
+  onCompareBaseChange,
   onClose,
   frameless,
 }: FilesPanelProps) {
@@ -332,12 +343,14 @@ export function FilesPanel({
   const isDrawer = onClose !== undefined;
   const fillHeight = isDrawer || frameless === true;
   // CUSTOM PATCH (set5think fork): selected compare base for the Changes view.
-  // null = uncommitted working-tree view (original behavior). Persisted per
-  // conversation in localStorage so the choice survives panel remounts.
+  // null = uncommitted working-tree view (original behavior). AppShell lifts
+  // this (so the FileViewer diff shares the base); when the controlled props
+  // are absent the panel falls back to its own per-conversation localStorage
+  // state so it still works standalone.
   const compareBaseStorageKey = conversationId
     ? `omnigent:changes-compare-base:${conversationId}`
     : null;
-  const [compareBase, setCompareBaseState] = useState<string | null>(() => {
+  const [compareBaseLocal, setCompareBaseLocal] = useState<string | null>(() => {
     if (typeof window === "undefined" || !compareBaseStorageKey) return null;
     try {
       return window.localStorage.getItem(compareBaseStorageKey) || null;
@@ -345,9 +358,15 @@ export function FilesPanel({
       return null;
     }
   });
+  const controlled = onCompareBaseChange !== undefined;
+  const compareBase = controlled ? (compareBaseProp ?? null) : compareBaseLocal;
   const setCompareBase = useCallback(
     (next: string | null) => {
-      setCompareBaseState(next);
+      if (onCompareBaseChange) {
+        onCompareBaseChange(next);
+        return;
+      }
+      setCompareBaseLocal(next);
       if (typeof window === "undefined" || !compareBaseStorageKey) return;
       try {
         if (next) window.localStorage.setItem(compareBaseStorageKey, next);
@@ -356,7 +375,7 @@ export function FilesPanel({
         /* ignore quota/access errors */
       }
     },
-    [compareBaseStorageKey],
+    [onCompareBaseChange, compareBaseStorageKey],
   );
   const branchesQuery = useSessionBranches(conversationId, { enabled: flatView });
   const changedQuery = useWorkspaceChangedFiles(
@@ -525,7 +544,12 @@ export function FilesPanel({
       {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
         <h2 className="shrink-0 font-medium text-ui">{flatView ? "Changes" : "Working folder"}</h2>
-        {workingDir && workspaceRoot && (
+        {/* CUSTOM PATCH (set5think fork): the browse-location bar only scopes the
+            folder TREE (Working folder); it has no effect on the git-based
+            Changes list, where the compare base is the real control. Showing it
+            in Changes misled users into expecting it to filter results, so it is
+            restricted to the tree view. */}
+        {!flatView && workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}
             workspace={workspaceRoot}

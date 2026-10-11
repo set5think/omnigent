@@ -406,6 +406,21 @@ export function AppShell() {
   const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
     () => readFilesPanelPreferences().sort,
   );
+  // CUSTOM PATCH (set5think fork): selected compare base for the Changes panel,
+  // lifted here (like filesPanelSort) so the FileViewer's per-file diff and the
+  // changed-file list share one base, and it survives inline↔drawer transitions.
+  // null = uncommitted working-tree view. Persisted per-conversation.
+  const compareBaseStorageKey = conversationId
+    ? `omnigent:changes-compare-base:${conversationId}`
+    : null;
+  const [compareBase, setCompareBaseState] = useState<string | null>(() => {
+    if (typeof window === "undefined" || !compareBaseStorageKey) return null;
+    try {
+      return window.localStorage.getItem(compareBaseStorageKey) || null;
+    } catch {
+      return null;
+    }
+  });
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
@@ -1185,6 +1200,40 @@ export function AppShell() {
     setFilesPanelSort(s);
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
+
+  // CUSTOM PATCH (set5think fork): persist the compare-base selection per
+  // conversation, and re-seed it when the active conversation changes.
+  const handleCompareBaseChange = useCallback(
+    (next: string | null) => {
+      setCompareBaseState(next);
+      if (typeof window === "undefined" || !compareBaseStorageKey) return;
+      try {
+        if (next) window.localStorage.setItem(compareBaseStorageKey, next);
+        else window.localStorage.removeItem(compareBaseStorageKey);
+      } catch {
+        /* ignore quota/access errors */
+      }
+    },
+    [compareBaseStorageKey],
+  );
+  const compareBaseConvRef = useRef(conversationId);
+  useEffect(() => {
+    if (compareBaseConvRef.current === conversationId) return;
+    compareBaseConvRef.current = conversationId;
+    if (typeof window === "undefined") {
+      setCompareBaseState(null);
+      return;
+    }
+    try {
+      setCompareBaseState(
+        conversationId
+          ? window.localStorage.getItem(`omnigent:changes-compare-base:${conversationId}`) || null
+          : null,
+      );
+    } catch {
+      setCompareBaseState(null);
+    }
+  }, [conversationId]);
 
   const commitFileNavigation = useCallback(
     (path: string, options?: OpenFileOptions) => {
@@ -2272,6 +2321,8 @@ export function AppShell() {
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
+                    compareBase={compareBase}
+                    onCompareBaseChange={handleCompareBaseChange}
                     filesPanelShowHidden={filesPanelShowHidden}
                     onShowHiddenChange={setFilesPanelShowHidden}
                     liveness={liveness}
@@ -2316,6 +2367,8 @@ export function AppShell() {
                   onShowHiddenChange={setFilesPanelShowHidden}
                   sort={filesPanelSort}
                   onSortChange={handleFilesSortChange}
+                  compareBase={compareBase}
+                  onCompareBaseChange={handleCompareBaseChange}
                 />
               )}
               {/* Mobile-only full-screen drawers for the rail tabs that have no
@@ -2371,6 +2424,7 @@ export function AppShell() {
                     onNavigateTo={openFileViewer}
                     permissionLevel={permissionLevel}
                     sort={filesPanelSort}
+                    baseRef={compareBase ?? undefined}
                   />
                 </div>
               )}

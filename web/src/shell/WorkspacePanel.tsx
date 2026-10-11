@@ -672,6 +672,9 @@ interface WorkspacePanelProps {
   filesPanelSort: ChangedSort;
   /** Change the changed-files sort order. */
   onSortChange: (sort: ChangedSort) => void;
+  /** CUSTOM PATCH (set5think fork): compare-to-base ref (null = uncommitted). */
+  compareBase?: string | null;
+  onCompareBaseChange?: (next: string | null) => void;
   /** Whether the Files panel shows dotfiles/hidden entries. */
   filesPanelShowHidden: boolean;
   /** Toggle hidden-file visibility in the Files panel. */
@@ -736,6 +739,8 @@ function WorkspacePanelImpl({
   permissionLevel,
   filesPanelSort,
   onSortChange,
+  compareBase = null,
+  onCompareBaseChange,
   filesPanelShowHidden,
   onShowHiddenChange,
   liveness,
@@ -1279,6 +1284,7 @@ function WorkspacePanelImpl({
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
+            baseRef={compareBase ?? undefined}
           />
         ) : sideChatSelected && sideChats.selected !== null ? (
           // A side chat: a forked child conversation streamed here in its own
@@ -1320,6 +1326,8 @@ function WorkspacePanelImpl({
               onShowHiddenChange={onShowHiddenChange}
               sort={filesPanelSort}
               onSortChange={onSortChange}
+              compareBase={compareBase}
+              onCompareBaseChange={onCompareBaseChange}
             />
           )
         )}
