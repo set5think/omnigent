@@ -11240,6 +11240,7 @@ def create_runner_app(
     async def list_filesystem_changes(
         session_id: str,
         environment_id: str,  # noqa: ARG001
+        base_ref: str | None = None,
     ) -> JSONResponse:
         import asyncio as _asyncio
 
@@ -11254,11 +11255,15 @@ def create_runner_app(
             # Offload to a thread so it never blocks the event loop — a blocked
             # loop can't answer the server's runner-stream relay probe and the
             # session's first turn 503s with runner_unavailable.
+            # CUSTOM PATCH (set5think fork): base_ref enables compare-to-base mode.
             raw_changes = (
                 await _asyncio.to_thread(
-                    session_registry.list_changed_files,
-                    session_id,
-                    limit=10_000,
+                    functools.partial(
+                        session_registry.list_changed_files,
+                        session_id,
+                        limit=10_000,
+                        base_ref=base_ref or None,
+                    )
                 )
                 if session_registry is not None
                 else []
@@ -11294,6 +11299,7 @@ def create_runner_app(
         session_id: str,
         environment_id: str,
         relative_path: str,
+        base_ref: str | None = None,
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
@@ -11332,13 +11338,29 @@ def create_runner_app(
         try:
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
-            record = (
-                await _asyncio.to_thread(
-                    session_registry.get_changed_file, session_id, relative_path
+            # CUSTOM PATCH (set5think fork): in compare-to-base mode the file may
+            # be committed (not in the uncommitted `git status`), so resolve the
+            # record from the base-mode changed list instead of get_changed_file.
+            if base_ref and session_registry is not None:
+                base_records = await _asyncio.to_thread(
+                    functools.partial(
+                        session_registry.list_changed_files,
+                        session_id,
+                        limit=10_000,
+                        base_ref=base_ref,
+                    )
                 )
-                if session_registry is not None
-                else None
-            )
+                record = next(
+                    (r for r in base_records if r.get("path") == relative_path), None
+                )
+            else:
+                record = (
+                    await _asyncio.to_thread(
+                        session_registry.get_changed_file, session_id, relative_path
+                    )
+                    if session_registry is not None
+                    else None
+                )
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -11360,7 +11382,9 @@ def create_runner_app(
         is_deleted = record.get("status") == "deleted"
 
         before: str | None = (
-            await _asyncio.to_thread(session_registry.get_baseline, relative_path)
+            await _asyncio.to_thread(
+                functools.partial(session_registry.get_baseline, relative_path, base_ref or None)
+            )
             if session_registry is not None
             else None
         )
@@ -11381,6 +11405,37 @@ def create_runner_app(
                 "path": relative_path,
                 "before": before,
                 "after": after,
+            },
+        )
+
+    # ── CUSTOM PATCH (set5think fork): local git branches for the base-branch
+    # compare selector in the right-hand Changes panel. Lists local branch names
+    # (current first) + the derived default base (origin/HEAD -> main/master).
+    @app.get(
+        "/v1/sessions/{session_id}/resources/environments/{environment_id}/branches"
+    )
+    async def list_filesystem_branches(
+        session_id: str,
+        environment_id: str,  # noqa: ARG001
+    ) -> JSONResponse:
+        import asyncio as _asyncio
+
+        await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id)
+        branches: list[str] = []
+        default_base: str | None = None
+        # Only git-backed registries expose branches; others return empty.
+        if session_registry is not None and hasattr(session_registry, "list_branches"):
+            branches = await _asyncio.to_thread(session_registry.list_branches)
+            default_base = await _asyncio.to_thread(session_registry.default_base)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "object": "list",
+                "data": branches,
+                "default_base": default_base,
+                "has_more": False,
             },
         )
 
