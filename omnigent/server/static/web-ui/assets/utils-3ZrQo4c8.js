@@ -1,0 +1,1 @@
+import{I as e,L as t}from"./streamdown-Bpng-vW9.js";var n=e({extend:{classGroups:{"font-size":[`text-ui`]}}});function r(...e){return n(t(e))}export{r as t};
