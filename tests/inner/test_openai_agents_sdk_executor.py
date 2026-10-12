@@ -3229,3 +3229,103 @@ def test_no_compaction_item_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM PATCH (set5think fork) — real OpenAI Agents SDK integration guard.
+#
+# Reproduces the exact production failure (house-helper / qwen3-vl):
+# conversation history replayed into SDK session memory carried an
+# ``input_image`` block with only a ``file_id`` (an unresolved reference), and
+# the SDK's own ``chatcmpl_converter`` rejected the WHOLE turn with
+# "Only image URLs are supported for input_image {...}". These tests drive the
+# REAL SDK converter (not a stub) to prove the sanitizer's output is accepted.
+# ─────────────────────────────────────────────────────────────────────────────
+def _sdk_extract_all_content(blocks):
+    """Run the real OpenAI Agents SDK chatcmpl converter over content blocks.
+
+    Returns the converted Chat Completions content parts, or raises the same
+    ``UserError`` the SDK would raise in production for an invalid input_image.
+    """
+    from agents.models.chatcmpl_converter import Converter
+
+    return Converter.extract_all_content(blocks)
+
+
+def test_sdk_rejects_bare_file_id_input_image_without_our_fix() -> None:
+    """Guard: the SDK converter DOES reject a bare-file_id input_image.
+
+    This pins the production failure mode so the fix below is meaningful: a
+    block the old sanitizer forwarded verbatim crashes the real SDK converter.
+    """
+    from agents.exceptions import UserError
+
+    raised = False
+    try:
+        _sdk_extract_all_content([{"type": "input_image", "file_id": "file_abc123"}])
+    except UserError as e:
+        raised = True
+        assert "Only image URLs are supported for input_image" in str(e)
+    assert raised, "Expected the SDK converter to reject a file_id-only input_image"
+
+
+def test_sanitized_bare_file_id_image_is_accepted_by_sdk() -> None:
+    """After our sanitizer, a bare-file_id image no longer crashes the SDK.
+
+    The unresolved image becomes a text placeholder, which the real SDK
+    converter accepts — so the turn runs instead of failing hard.
+    """
+    sanitized = _normalize_content_blocks_for_chat(
+        [{"type": "input_image", "file_id": "file_abc123"}]
+    )
+    # Must not raise — this is the whole point of the fix.
+    parts = _sdk_extract_all_content(sanitized)
+    assert isinstance(parts, list)
+    assert all(p.get("type") != "image_url" for p in parts)  # the bad image is gone
+    assert any(p.get("type") == "text" for p in parts)  # replaced by a placeholder
+
+
+def test_sanitized_legit_image_url_survives_to_sdk_image_part() -> None:
+    """A legitimate (resolved) same-session image passes through to a real SDK
+    image_url content part — the fix does NOT drop valid images."""
+    sanitized = _normalize_content_blocks_for_chat(
+        [
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abcd",
+                "file_id": "file_abc123",
+                "detail": "high",
+            }
+        ]
+    )
+    parts = _sdk_extract_all_content(sanitized)
+    image_parts = [p for p in parts if p.get("type") == "image_url"]
+    assert len(image_parts) == 1, parts
+    assert image_parts[0]["image_url"]["url"] == "data:image/png;base64,abcd"
+
+
+def test_full_hook_mixed_history_is_accepted_by_sdk() -> None:
+    """End-to-end over the model-input hook: a realistic mixed history (text +
+    a resolved image + an unresolved cross-session file_id image) is normalized
+    by _normalize_responses_items_for_chat and every message's content is then
+    accepted by the real SDK converter without raising."""
+    items = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "make my kitchen warmer"},
+                {"type": "input_image", "image_url": "data:image/png;base64,abcd"},
+                {"type": "input_image", "file_id": "file_crosssession"},
+            ],
+        }
+    ]
+    normalized = _normalize_responses_items_for_chat(items)
+    # Every message item's content must be SDK-convertible without raising.
+    for item in normalized:
+        content = item.get("content")
+        if isinstance(content, list):
+            parts = _sdk_extract_all_content(content)
+            # The resolved image survives; the unresolved one is gone.
+            image_parts = [p for p in parts if p.get("type") == "image_url"]
+            assert len(image_parts) == 1
