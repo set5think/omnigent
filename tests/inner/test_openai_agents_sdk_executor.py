@@ -2207,6 +2207,50 @@ def test_normalize_content_blocks_data_uri_input_image_is_preserved() -> None:
     assert result == [{"type": "input_image", "image_url": "data:image/png;base64,abcd"}]
 
 
+def test_normalize_content_blocks_unresolved_file_id_image_dropped() -> None:
+    """CUSTOM PATCH (set5think fork): an input_image with ONLY a file_id (no
+    usable image_url) is an unresolved reference — the OpenAI Agents SDK rejects
+    it ("Only image URLs are supported for input_image"), so it must be dropped
+    (never forwarded) and replaced with a placeholder, keeping the turn alive."""
+    result = _normalize_content_blocks_for_chat(
+        [{"type": "input_image", "file_id": "file_abc123"}]
+    )
+    assert result == [
+        {"type": "input_text", "text": "[an image here could not be loaded and was omitted]"}
+    ], result
+    # The crashing field must never reach the SDK.
+    assert all("file_id" not in b for b in result)
+
+
+def test_normalize_content_blocks_image_url_wins_and_file_id_stripped() -> None:
+    """When both image_url and file_id are present, keep the usable image_url
+    and strip the (SDK-unsupported) file_id."""
+    result = _normalize_content_blocks_for_chat(
+        [
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,abcd",
+                "file_id": "file_abc123",
+                "detail": "high",
+            }
+        ]
+    )
+    assert result == [
+        {"type": "input_image", "image_url": "data:image/png;base64,abcd", "detail": "high"}
+    ], result
+
+
+def test_normalize_content_blocks_blank_image_url_file_id_dropped() -> None:
+    """A blank/whitespace image_url with only a file_id is treated as unresolved
+    and dropped (not forwarded with the file_id)."""
+    result = _normalize_content_blocks_for_chat(
+        [{"type": "input_image", "image_url": "   ", "file_id": "file_abc123"}]
+    )
+    assert result == [
+        {"type": "input_text", "text": "[an image here could not be loaded and was omitted]"}
+    ], result
+
+
 def test_normalize_content_blocks_empty_file_data_dropped() -> None:
     """``input_file`` with empty ``file_data`` is silently dropped."""
     result = _normalize_content_blocks_for_chat([{"type": "input_file", "file_data": ""}])
