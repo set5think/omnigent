@@ -2440,6 +2440,36 @@ def register_resources_routes(
             host_workspace_resolver=resolver,
         )
 
+    # ── CUSTOM PATCH (set5think fork): local branches for the base-branch
+    # compare selector in the right-hand Changes panel. Proxies the runner's
+    # branches route; needs a live runner (no host fallback — branch metadata
+    # isn't served by the offline host reader).
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/branches",
+        response_model=None,
+        include_in_schema=False,
+    )
+    async def list_environment_filesystem_branches(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+    ) -> Any:
+        """List local git branches + derived default base for the compare picker.
+
+        :returns: ``{"object": "list", "data": [names], "default_base": name|null}``.
+            Empty when the workspace is not a git repo or the runner is offline.
+        """
+        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/branches"
+        conv = await _authorize_browse_read(session_id, request)
+        try:
+            return await _proxy_get_to_runner(session_id, path, conv)
+        except OmnigentError as exc:
+            # Runner offline → return an empty picker rather than erroring the
+            # whole panel; the Changes list itself has its own offline handling.
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                return {"object": "list", "data": [], "default_base": None, "has_more": False}
+            raise
+
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/changes",
         response_model=None,
@@ -2448,6 +2478,7 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         environment_id: str,
+        base_ref: str | None = None,
     ) -> Any:
         """
         List all files changed since session start (flat, registry-backed).
@@ -2459,16 +2490,20 @@ def register_resources_routes(
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
+        :param base_ref: Optional base branch to compare against (compare-to-base
+            mode); omitted = the uncommitted working-tree view.
         :returns: Flat list of changed filesystem entries with ``status``.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
         conv = await _authorize_browse_read(session_id, request)
+        runner_params = {"base_ref": base_ref} if base_ref else None
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="changes",
-            host_params={},
+            host_params={"base_ref": base_ref} if base_ref else {},
             runner_path=path,
+            runner_params=runner_params,
         )
 
     @file_read_router.get(
@@ -2482,6 +2517,7 @@ def register_resources_routes(
         session_id: str,
         environment_id: str,
         relative_path: str,
+        base_ref: str | None = None,
     ) -> Any:
         """
         Return before/after diff content for a changed file.
@@ -2494,6 +2530,8 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param relative_path: Path relative to environment root.
+        :param base_ref: Optional base branch (compare-to-base mode); the diff
+            baseline is then the merge-base content vs that base.
         :returns: JSON with ``before`` and ``after`` content strings.
         """
         path = (
@@ -2501,12 +2539,17 @@ def register_resources_routes(
             f"/{environment_id}/diff/{relative_path}"
         )
         conv = await _authorize_browse_read(session_id, request, relative_path)
+        runner_params = {"base_ref": base_ref} if base_ref else None
+        host_params: dict[str, Any] = {"path": relative_path}
+        if base_ref:
+            host_params["base_ref"] = base_ref
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="diff",
-            host_params={"path": relative_path},
+            host_params=host_params,
             runner_path=path,
+            runner_params=runner_params,
         )
 
     @file_read_router.get(

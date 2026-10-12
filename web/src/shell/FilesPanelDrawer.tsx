@@ -46,6 +46,9 @@ interface FilesPanelDrawerProps {
    */
   sort: ChangedSort;
   onSortChange: (sort: ChangedSort) => void;
+  /** CUSTOM PATCH (set5think fork): compare-to-base ref (null = uncommitted). */
+  compareBase?: string | null;
+  onCompareBaseChange?: (next: string | null) => void;
 }
 
 export function FilesPanelDrawer({
@@ -57,6 +60,8 @@ export function FilesPanelDrawer({
   onShowHiddenChange,
   sort,
   onSortChange,
+  compareBase,
+  onCompareBaseChange,
 }: FilesPanelDrawerProps) {
   const { panelWidth, handleProps, isDesktop } = useResizablePanel(open);
   const ref = useRef<HTMLElement>(null);
@@ -114,6 +119,8 @@ export function FilesPanelDrawer({
           onShowHiddenChange={onShowHiddenChange}
           sort={sort}
           onSortChange={onSortChange}
+          compareBase={compareBase}
+          onCompareBaseChange={onCompareBaseChange}
           onClose={onClose}
         />
       )}

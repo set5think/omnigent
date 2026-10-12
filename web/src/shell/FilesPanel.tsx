@@ -1,10 +1,12 @@
 import {
   ArrowDownAZIcon,
   ArrowDownWideNarrowIcon,
+  CheckIcon,
   EyeIcon,
   EyeOffIcon,
   FileClockIcon,
   FileTypeIcon,
+  GitBranchIcon,
   MoonIcon,
   SearchIcon,
   SlidersHorizontalIcon,
@@ -21,6 +23,7 @@ import {
   joinBrowseLocation,
   relativizeToWorkspace,
   useWorkspaceChangedFiles,
+  useSessionBranches,
   useWorkspaceAllFiles,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
@@ -61,6 +64,15 @@ interface FilesPanelProps {
    */
   sort: ChangedSort;
   onSortChange: (sort: ChangedSort) => void;
+  /**
+   * CUSTOM PATCH (set5think fork): compare-to-base selection, lifted to
+   * AppShell so the FileViewer's diff and this list share one base and it
+   * survives inline↔drawer transitions. null = uncommitted working-tree view.
+   * When omitted, the panel falls back to its own per-conversation state
+   * (keeps it usable standalone, e.g. in stories/tests).
+   */
+  compareBase?: string | null;
+  onCompareBaseChange?: (next: string | null) => void;
   /**
    * When provided, the panel renders an X close button in the header and
    * fills its parent's height — dropping the rounded card chrome so it can
@@ -171,6 +183,61 @@ function SortSelector({
 }
 
 // ---------------------------------------------------------------------------
+// BranchSelect — CUSTOM PATCH (set5think fork): compare-to-base selector for
+// the Changes view. "Uncommitted" (null) diffs the working tree vs HEAD (the
+// original behavior); picking a branch diffs this branch vs the merge-base with
+// that base (`git diff <base>...HEAD`), so the list stays populated after the
+// agent commits. Mirrors SortSelector's DropdownMenu house style.
+// ---------------------------------------------------------------------------
+
+const UNCOMMITTED = "__uncommitted__";
+
+function BranchSelect({
+  branches,
+  value,
+  onChange,
+}: {
+  branches: string[];
+  /** Selected base branch name, or null for the uncommitted working-tree view. */
+  value: string | null;
+  onChange: (next: string | null) => void;
+}) {
+  const label = value ?? "Uncommitted";
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label={`Compare: ${label}`}
+          title={value ? `Comparing against ${value}` : "Showing uncommitted changes"}
+          className="flex min-w-0 shrink cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-sm hover:bg-muted hover:text-foreground"
+        >
+          <GitBranchIcon className="size-3.5 shrink-0" />
+          <span className="truncate">{label}</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-80 w-56 overflow-auto">
+        <DropdownMenuRadioGroup
+          value={value ?? UNCOMMITTED}
+          onValueChange={(v) => onChange(v === UNCOMMITTED ? null : v)}
+        >
+          <DropdownMenuRadioItem value={UNCOMMITTED}>
+            <CheckIcon className="size-3.5 opacity-0 data-[selected=true]:opacity-100" />
+            Uncommitted
+          </DropdownMenuRadioItem>
+          {branches.map((b) => (
+            <DropdownMenuRadioItem key={b} value={b}>
+              <GitBranchIcon className="size-3.5" />
+              <span className="truncate">{b}</span>
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // SearchFilterInput — labeled glob input for "files to include" / "exclude"
 // ---------------------------------------------------------------------------
 
@@ -233,6 +300,8 @@ export function FilesPanel({
   onShowHiddenChange,
   sort: changedSort,
   onSortChange,
+  compareBase: compareBaseProp,
+  onCompareBaseChange,
   onClose,
   frameless,
 }: FilesPanelProps) {
@@ -273,9 +342,49 @@ export function FilesPanel({
   // rounded card chrome; only the standalone card caps content at max-h.
   const isDrawer = onClose !== undefined;
   const fillHeight = isDrawer || frameless === true;
-  const changedQuery = useWorkspaceChangedFiles(conversationId, {
-    enabled: true,
+  // CUSTOM PATCH (set5think fork): selected compare base for the Changes view.
+  // null = uncommitted working-tree view (original behavior). AppShell lifts
+  // this (so the FileViewer diff shares the base); when the controlled props
+  // are absent the panel falls back to its own per-conversation localStorage
+  // state so it still works standalone.
+  const compareBaseStorageKey = conversationId
+    ? `omnigent:changes-compare-base:${conversationId}`
+    : null;
+  const [compareBaseLocal, setCompareBaseLocal] = useState<string | null>(() => {
+    if (typeof window === "undefined" || !compareBaseStorageKey) return null;
+    try {
+      return window.localStorage.getItem(compareBaseStorageKey) || null;
+    } catch {
+      return null;
+    }
   });
+  const controlled = onCompareBaseChange !== undefined;
+  const compareBase = controlled ? (compareBaseProp ?? null) : compareBaseLocal;
+  const setCompareBase = useCallback(
+    (next: string | null) => {
+      if (onCompareBaseChange) {
+        onCompareBaseChange(next);
+        return;
+      }
+      setCompareBaseLocal(next);
+      if (typeof window === "undefined" || !compareBaseStorageKey) return;
+      try {
+        if (next) window.localStorage.setItem(compareBaseStorageKey, next);
+        else window.localStorage.removeItem(compareBaseStorageKey);
+      } catch {
+        /* ignore quota/access errors */
+      }
+    },
+    [onCompareBaseChange, compareBaseStorageKey],
+  );
+  const branchesQuery = useSessionBranches(conversationId, { enabled: flatView });
+  const changedQuery = useWorkspaceChangedFiles(
+    conversationId,
+    {
+      enabled: true,
+    },
+    compareBase ?? undefined,
+  );
   const envQuery = useWorkspaceEnvironment(conversationId, {
     enabled: true,
   });
@@ -435,7 +544,12 @@ export function FilesPanel({
       {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
         <h2 className="shrink-0 font-medium text-ui">{flatView ? "Changes" : "Working folder"}</h2>
-        {workingDir && workspaceRoot && (
+        {/* CUSTOM PATCH (set5think fork): the browse-location bar only scopes the
+            folder TREE (Working folder); it has no effect on the git-based
+            Changes list, where the compare base is the real control. Showing it
+            in Changes misled users into expecting it to filter results, so it is
+            restricted to the tree view. */}
+        {!flatView && workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}
             workspace={workspaceRoot}
@@ -513,6 +627,11 @@ export function FilesPanel({
                 value={changedSearch}
               />
             </div>
+            <BranchSelect
+              branches={branchesQuery.data?.branches ?? []}
+              value={compareBase}
+              onChange={setCompareBase}
+            />
             <SortSelector sort={changedSort} onChange={onSortChange} />
           </div>
         </div>

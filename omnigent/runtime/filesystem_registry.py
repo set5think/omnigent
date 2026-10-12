@@ -210,6 +210,119 @@ def _find_git_root(path: Path) -> Path | None:
         current = parent
 
 
+# ── CUSTOM PATCH (set5think fork): base-branch diff support ──────────────
+# Shared helpers for the right-hand "Changes" panel's base-branch compare mode.
+# Mirror the GitHub-path semantics in omnigent/runner/github_resource.py
+# (resolve_base_ref/_resolve_diff_base) but operate on PURELY LOCAL git — no
+# `gh`, no PR required — so the panel can diff the branch against any local or
+# remote-tracking base using merge-base (three-dot / "Files changed") semantics.
+# See the omnigent-fork skill manifest.
+
+#: Candidate default base branches, in order, when none is derivable from
+#: ``origin/HEAD``. Matches the common conventions users expect.
+_DEFAULT_BASE_CANDIDATES = ("main", "master")
+
+
+def _run_git_capture(argv: list[str], cwd: Path) -> tuple[int | None, str]:
+    """Run a git command, returning ``(returncode, stdout)``; never raises.
+
+    :param argv: Git args WITHOUT the leading ``"git"``.
+    :param cwd: Working directory to run in.
+    :returns: ``(returncode, decoded_stdout)``; ``(None, "")`` on spawn
+        failure or timeout.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *argv],
+            cwd=str(cwd),
+            capture_output=True,
+            timeout=_git_timeout_seconds(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None, ""
+    return result.returncode, result.stdout.decode("utf-8", errors="replace")
+
+
+def _derive_default_base(git_root: Path) -> str | None:
+    """Return the repo's default base branch name, or ``None``.
+
+    Prefers ``origin/HEAD`` (the remote's default branch, e.g. ``origin/main``
+    → ``main``), then falls back to the first of :data:`_DEFAULT_BASE_CANDIDATES`
+    that exists locally or as a remote-tracking ref. Never raises.
+
+    :param git_root: Absolute repository root.
+    :returns: A base branch name (no ``refs/`` or ``origin/`` prefix), or
+        ``None`` when nothing resolves.
+    """
+    rc, out = _run_git_capture(
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], git_root
+    )
+    head = out.strip()
+    if rc == 0 and head:
+        # e.g. "origin/main" -> "main"
+        return head.split("/", 1)[1] if head.startswith("origin/") else head
+    for name in _DEFAULT_BASE_CANDIDATES:
+        for candidate in (name, f"origin/{name}"):
+            rc, _ = _run_git_capture(
+                ["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], git_root
+            )
+            if rc == 0:
+                return name
+    return None
+
+
+def _list_local_branches(git_root: Path) -> list[str]:
+    """Return local branch names, current branch first, then alphabetical.
+
+    Uses ``git for-each-ref`` over ``refs/heads``. Never raises; returns an
+    empty list on failure.
+
+    :param git_root: Absolute repository root.
+    :returns: Branch names without the ``refs/heads/`` prefix.
+    """
+    rc, out = _run_git_capture(
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads"], git_root
+    )
+    if rc != 0:
+        return []
+    branches = sorted({line.strip() for line in out.splitlines() if line.strip()})
+    rc2, cur = _run_git_capture(["branch", "--show-current"], git_root)
+    current = cur.strip() if rc2 == 0 else ""
+    if current and current in branches:
+        branches.remove(current)
+        branches.insert(0, current)
+    return branches
+
+
+def _resolve_local_diff_base(git_root: Path, base: str) -> str | None:
+    """Resolve a base branch name to the ref to diff HEAD against.
+
+    Prefers the merge-base of ``origin/<base>`` (or ``<base>``) and HEAD, giving
+    three-dot / "Files changed" semantics (only this branch's own changes, not
+    commits that landed on the base since branching). Falls back to the base
+    ref itself, then ``None``. Mirrors ``github_resource._resolve_diff_base``
+    but local-only. Never raises.
+
+    :param git_root: Absolute repository root.
+    :param base: Base branch name, e.g. ``"main"``.
+    :returns: A ref (SHA or name) to diff against, or ``None``.
+    """
+    resolved: str | None = None
+    for candidate in (f"origin/{base}", base):
+        rc, _ = _run_git_capture(
+            ["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], git_root
+        )
+        if rc == 0:
+            resolved = candidate
+            break
+    if resolved is None:
+        return None
+    rc, out = _run_git_capture(["merge-base", resolved, "HEAD"], git_root)
+    if rc == 0 and out.strip():
+        return out.strip()
+    return resolved
+
+
 def _git_common_dir(git_root: Path) -> Path:
     """Return the Git directory shared by a repository and its worktrees."""
     git_entry = git_root / ".git"
@@ -549,11 +662,15 @@ class FilesystemRegistry(ABC):
     # ── Abstract: must be implemented by subclasses ───────────────
 
     @abstractmethod
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, base_ref: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return changed files visible to *conversation_id*, newest first.
 
         :param conversation_id: The session to query, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param base_ref: Optional base branch to compare against (git-backed
+            registries only); ``None`` means the uncommitted working-tree view.
         :returns: List of file-record dicts with ``path``, ``status``,
             ``bytes``, and ``modified_at`` fields, newest first.
         """
@@ -569,10 +686,12 @@ class FilesystemRegistry(ABC):
         """
 
     @abstractmethod
-    def get_baseline(self, path: str) -> str | None:
+    def get_baseline(self, path: str, base_ref: str | None = None) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
 
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param base_ref: Optional base branch (git-backed registries only);
+            when set, the baseline is the merge-base content vs that base.
         :returns: File content before modification, or ``None`` when no
             baseline is available (new/untracked file, or no snapshot seeded).
         """
@@ -677,15 +796,22 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             for p in paths:
                 self._snapshots.pop(p, None)
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, base_ref: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return files changed by the agent in *conversation_id*'s session.
 
         :param conversation_id: The session to query, e.g.
             ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param base_ref: Accepted for interface parity; this non-git registry
+            has no base to compare against, so a non-empty ``base_ref`` yields
+            an empty list (the compare-to-base view requires a git workspace).
         :returns: List of file-record dicts suitable for the
             ``workspace.changed_files`` API response, newest first.
         """
+        if base_ref:
+            return []
         with self._lock:
             events = list(self._session_events.get(conversation_id, []))
         # Track the first and last operation seen per path so that
@@ -763,15 +889,17 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             "modified_at": last_event.modified_at,
         }
 
-    def get_baseline(self, path: str) -> str | None:
+    def get_baseline(self, path: str, base_ref: str | None = None) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
 
         Falls back to the in-memory snapshot captured by :meth:`seed_snapshot`
         before the first write/edit API call.  Returns ``None`` if no snapshot
-        was captured (e.g. the file was created new this session).
+        was captured (e.g. the file was created new this session). ``base_ref``
+        is accepted for interface parity and ignored (snapshot-based baseline).
 
         :param path: Path relative to the workspace root,
             e.g. ``"src/foo.py"``.
+        :param base_ref: Ignored for the non-git snapshot registry.
         :returns: File content before it was first modified this session, or
             ``None`` when no baseline is available.
         """
@@ -948,17 +1076,27 @@ class GitFilesystemRegistry(FilesystemRegistry):
             config.returncode,
         )
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
-        """Return all uncommitted changes in the working tree, newest first.
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, base_ref: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return changed files, newest first.
 
-        *conversation_id* is accepted for API compatibility but is not used
-        to filter results — git status always reflects the current state
-        relative to HEAD.
+        Default (``base_ref=None``): all uncommitted working-tree changes
+        relative to HEAD (``git status``). When ``base_ref`` is a branch name,
+        instead return this branch's changes vs the merge-base with that base
+        (``git diff --name-status <merge-base>...HEAD``) — the "Files changed"
+        / compare-to-base view, which stays populated even after the agent
+        commits. *conversation_id* is accepted for API compatibility but is not
+        used to filter results.
 
         :param conversation_id: Ignored for git-backed registries.
         :param limit: Maximum number of records to return.
+        :param base_ref: Optional base branch name to compare against; when set,
+            uses merge-base diff semantics instead of the uncommitted view.
         :returns: List of file-record dicts, newest first.
         """
+        if base_ref:
+            return self._list_changed_vs_base(base_ref, limit=limit)
         # ``--untracked-files=all`` forces git to expand entirely-untracked
         # directories into their individual files.  Without it, a new file
         # inside a brand-new directory tree collapses to a single ``?? dir/``
@@ -1120,12 +1258,18 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         return None
 
-    def get_baseline(self, path: str) -> str | None:
-        """Return committed content via ``git show HEAD:<path>``.
+    def get_baseline(self, path: str, base_ref: str | None = None) -> str | None:
+        """Return committed baseline content via ``git show <ref>:<path>``.
+
+        Default (``base_ref=None``): the file at ``HEAD`` (the uncommitted-view
+        baseline). When ``base_ref`` is set, the content at the merge-base with
+        that base branch, so the diff view's "before" matches compare-to-base
+        mode. Returns ``None`` for new/untracked files or on subprocess failure.
 
         :param path: Path relative to the workspace root.
-        :returns: Content of the file at HEAD, or ``None`` for new/untracked
-            files or when the subprocess fails.
+        :param base_ref: Optional base branch name; when set, read from the
+            merge-base of that base with HEAD instead of HEAD.
+        :returns: Baseline content, or ``None``.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -1136,9 +1280,16 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
+        ref = "HEAD"
+        if base_ref:
+            diff_base = _resolve_local_diff_base(self._git_root, base_ref)
+            if diff_base is None:
+                return None
+            ref = diff_base
+
         try:
             result = subprocess.run(
-                ["git", "show", f"HEAD:{git_path}"],
+                ["git", "show", f"{ref}:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
@@ -1154,6 +1305,66 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return None
 
     # ── Internals ─────────────────────────────────────────────────
+
+    def list_branches(self) -> list[str]:
+        """Return local branch names (current first) for the base-branch picker.
+
+        CUSTOM PATCH (set5think fork). Never raises; ``[]`` on failure.
+        """
+        return _list_local_branches(self._git_root)
+
+    def default_base(self) -> str | None:
+        """Return the derived default base branch (origin/HEAD -> main/master).
+
+        CUSTOM PATCH (set5think fork). ``None`` when nothing resolves.
+        """
+        return _derive_default_base(self._git_root)
+
+    def _list_changed_vs_base(self, base_ref: str, *, limit: int) -> list[dict[str, Any]]:
+        """Return this branch's changes vs the merge-base with *base_ref*.
+
+        CUSTOM PATCH (set5think fork). Uses
+        ``git diff --name-status --no-renames <merge-base>...HEAD`` for the file
+        list (so renames split into delete+add, matching the uncommitted view's
+        record shape) and ``git diff --numstat <merge-base>...HEAD`` for counts.
+        Returns ``[]`` when the base cannot be resolved or the diff fails.
+
+        :param base_ref: Base branch name, e.g. ``"main"``.
+        :param limit: Maximum number of records to return.
+        :returns: File-record dicts, newest first (by on-disk mtime).
+        """
+        diff_base = _resolve_local_diff_base(self._git_root, base_ref)
+        if diff_base is None:
+            return []
+        diff_spec = f"{diff_base}...HEAD"
+        rc, out = _run_git_capture(
+            ["diff", "--name-status", "--no-renames", diff_spec, *self._skip_dir_pathspecs()],
+            self._git_root,
+        )
+        if rc != 0:
+            return []
+        numstat = self._run_git_numstat(diff_spec)
+        records: list[dict[str, Any]] = []
+        for line in out.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            status_code, git_path = fields[0], fields[-1]
+            operation = {
+                "A": "created",
+                "M": "modified",
+                "D": "deleted",
+            }.get(status_code[:1], "modified")
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None or _is_ephemeral(rel_path):
+                continue
+            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
+            if first_component in _SKIP_DIRS:
+                continue
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
+        records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
+        return records[:limit]
 
     def _skip_dir_pathspecs(self) -> list[str]:
         """Return ``:(exclude)`` pathspecs pruning :data:`_SKIP_DIRS` from status.
@@ -1223,8 +1434,13 @@ class GitFilesystemRegistry(FilesystemRegistry):
             "lines_removed": removed,
         }
 
-    def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
-        """Return per-file line counts from ``git diff --numstat HEAD``.
+    def _run_git_numstat(
+        self, diff_spec: str = "HEAD"
+    ) -> dict[str, tuple[int | None, int | None]]:
+        """Return per-file line counts from ``git diff --numstat <diff_spec>``.
+
+        ``diff_spec`` defaults to ``"HEAD"`` (uncommitted working-tree counts).
+        Pass a merge-base spec like ``"<sha>...HEAD"`` for compare-to-base mode.
 
         ``--no-renames`` splits a rename into two independent entries — a full
         add on the destination path and a full delete on the old path — so the
@@ -1239,7 +1455,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
         """
-        argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
+        argv = ["git", "diff", "--numstat", "--no-renames", diff_spec]
         try:
             result = subprocess.run(
                 argv,

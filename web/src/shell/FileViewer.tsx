@@ -321,6 +321,13 @@ interface FileViewerProps {
    * "X/N" index won't line up with the list. Defaults to "recent".
    */
   sort?: ChangedSort;
+  /**
+   * CUSTOM PATCH (set5think fork): compare-to-base ref. When set, the diff and
+   * the navigable changed-file list are computed against this base branch
+   * (merge-base), matching the Changes panel's selection. Undefined/omitted =
+   * the uncommitted working-tree view.
+   */
+  baseRef?: string;
 }
 
 /**
@@ -355,6 +362,7 @@ function FileViewerBody({
   viewport,
   onCommentsOpenChange,
   sort = "recent",
+  baseRef,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
@@ -391,8 +399,8 @@ function FileViewerBody({
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
   const fileQuery = useFileContent(conversationId, path);
-  const diffQuery = useFileDiff(conversationId, path);
-  const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const diffQuery = useFileDiff(conversationId, path, baseRef);
+  const changedFiles = useWorkspaceChangedFiles(conversationId, {}, baseRef);
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
@@ -701,8 +709,15 @@ function FileViewerBody({
   // Read once on mount so our own writes (and within-tab file navigation) don't
   // re-run the initializers.
   const persistedPrefsRef = useRef(readFileViewPreferences());
+  // CUSTOM PATCH (set5think fork): when a compare base is selected the user's
+  // intent is explicitly to review the branch's diff, so seed the diff view ON
+  // (they can still toggle it off). Captured once on mount like the other seeds.
+  const baseRefOnMountRef = useRef(baseRef);
   const [diffActive, setDiffActive] = useState(
-    () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
+    () =>
+      initialDiffRef.current ||
+      baseRefOnMountRef.current != null ||
+      persistedPrefsRef.current.diffActive,
   );
   const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
     () => persistedPrefsRef.current.diffLayout,
@@ -938,6 +953,19 @@ function FileViewerBody({
 
   // Sync diff state to URL. Skip when already in sync to avoid clobbering ?file=
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
+  // CUSTOM PATCH (set5think fork): if the user selects a compare base while a
+  // file is already open, flip that open file into diff view (their intent is
+  // to review the branch diff). Only fires on the unset→set transition so it
+  // never fights a manual toggle-off while a base stays selected.
+  const prevBaseRefRef = useRef(baseRef);
+  useEffect(() => {
+    const prev = prevBaseRefRef.current;
+    prevBaseRefRef.current = baseRef;
+    if (prev == null && baseRef != null) {
+      setDiffActive(true);
+    }
+  }, [baseRef]);
+
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
     if (!open || !ownsUrl) return;

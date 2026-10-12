@@ -9,6 +9,7 @@ import {
   PathUnreachableError,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
+  useSessionBranches,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
@@ -32,6 +33,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
+  useSessionBranches: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
   // The tree fetches expanded lazy dirs centrally via the plural hook; default
   // it to no expanded dirs (empty map). Tests that drive lazy content override.
@@ -69,6 +71,7 @@ const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useSearchMock = vi.mocked(useWorkspaceFileSearch);
+const useBranchesMock = vi.mocked(useSessionBranches);
 
 function file(path: string, bytes = 10): WorkspaceFile {
   return {
@@ -199,6 +202,9 @@ function renderPanel({
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
   useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching, isSearchPlaceholder));
+  useBranchesMock.mockReturnValue({
+    data: { branches: [], defaultBase: null },
+  } as unknown as ReturnType<typeof useSessionBranches>);
 
   return render(
     <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
@@ -360,9 +366,13 @@ describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
       changedFiles: [changedFile("src/App.tsx")],
     });
 
-    expect(useChangedFilesMock).toHaveBeenCalledWith("conv_changed_only", {
-      enabled: true,
-    });
+    expect(useChangedFilesMock).toHaveBeenCalledWith(
+      "conv_changed_only",
+      {
+        enabled: true,
+      },
+      undefined,
+    );
     expect(useAllFilesMock).toHaveBeenCalledWith("conv_changed_only", { enabled: false }, "");
     expect(useSearchMock).toHaveBeenCalledWith(
       "conv_changed_only",

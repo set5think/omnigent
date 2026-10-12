@@ -213,9 +213,13 @@ interface ChangedFilesResponse {
 
 async function fetchWorkspaceChangedFiles(
   conversationId: string,
+  baseRef?: string,
 ): Promise<WorkspaceChangedFilesResult> {
+  const params = new URLSearchParams();
+  if (baseRef) params.set("base_ref", baseRef);
+  const query = params.toString();
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes${query ? `?${query}` : ""}`,
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -264,6 +268,7 @@ async function fetchWorkspaceChangedFiles(
 export function useWorkspaceChangedFiles(
   conversationId: string | undefined,
   options: WorkspaceQueryOptions = {},
+  baseRef?: string,
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
@@ -274,8 +279,8 @@ export function useWorkspaceChangedFiles(
   const sessionActive = useSessionActive(conversationId);
   useTrailingInvalidate(conversationId, sessionActive, "workspace-changed-files");
   return useQuery({
-    queryKey: ["workspace-changed-files", conversationId],
-    queryFn: () => fetchWorkspaceChangedFiles(conversationId!),
+    queryKey: ["workspace-changed-files", conversationId, baseRef ?? null],
+    queryFn: () => fetchWorkspaceChangedFiles(conversationId!, baseRef),
     enabled:
       queryEnabled &&
       !!conversationId &&
@@ -288,6 +293,61 @@ export function useWorkspaceChangedFiles(
     // refetches via chatStore, and ``useTrailingInvalidate`` backstops
     // the final state at end-of-turn. The cold GET on mount bootstraps.
     staleTime: 5_000,
+  });
+}
+
+// ── Branches (base-branch compare selector) ───────────────────────────────────
+// CUSTOM PATCH (set5think fork): list local git branches + the derived default
+// base for the Changes panel's compare-to-base selector.
+
+export interface WorkspaceBranchesResult {
+  /** Local branch names, current branch first. Empty for non-git/offline. */
+  branches: string[];
+  /** Derived default base (origin/HEAD -> main/master), or null. */
+  defaultBase: string | null;
+}
+
+interface BranchesResponse {
+  object: "list";
+  data: string[];
+  default_base: string | null;
+  has_more: boolean;
+}
+
+async function fetchSessionBranches(conversationId: string): Promise<WorkspaceBranchesResult> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/branches`,
+  );
+  // Non-git workspace, headless session, or offline runner — present an empty
+  // picker rather than erroring the panel.
+  if (!res.ok) {
+    return { branches: [], defaultBase: null };
+  }
+  const json = (await res.json()) as BranchesResponse;
+  return {
+    branches: Array.isArray(json.data) ? json.data : [],
+    defaultBase: json.default_base ?? null,
+  };
+}
+
+/**
+ * List the session workspace's local git branches + derived default base,
+ * for the Changes panel's compare-to-base selector. Never throws to the UI:
+ * a non-git/offline workspace yields an empty branch list.
+ */
+export function useSessionBranches(
+  conversationId: string | undefined,
+  options: WorkspaceQueryOptions = {},
+) {
+  const queryEnabled = options.enabled ?? true;
+  const serveable = useWorkspaceServeable(conversationId);
+  return useQuery({
+    queryKey: ["workspace-branches", conversationId],
+    queryFn: () => fetchSessionBranches(conversationId!),
+    enabled: queryEnabled && !!conversationId && serveable !== false,
+    // Branches change rarely within a session; a longer stale window avoids
+    // refetching the picker on every panel re-open.
+    staleTime: 30_000,
   });
 }
 
