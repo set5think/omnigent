@@ -4863,6 +4863,38 @@ async def _host_harnesses_or_none(
     return readiness if isinstance(readiness, dict) else None
 
 
+async def _project_name_or_none(
+    project_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Resolve a project's human-readable name via ``GET /v1/projects/{id}``.
+
+    Best-effort, mirroring ``_runner_online_or_none`` /
+    ``_host_harnesses_or_none``: returns ``None`` when the session is
+    unfiled (no ``project_id``) or the lookup fails, so
+    ``sys_session_get_info`` still returns the raw ``project_id`` and
+    simply degrades to "name unknown" rather than erroring. The session
+    GET is already access-gated, so a resolvable id belongs to a project
+    the caller may read.
+
+    :param project_id: The session's filed project id, or ``None``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The project's ``name``, or ``None`` when unfiled or the
+        lookup is inconclusive.
+    """
+    if not project_id:
+        return None
+    try:
+        resp = await server_client.get(f"/v1/projects/{project_id}", timeout=30.0)
+        if resp.status_code != 200:
+            return None
+        name = resp.json().get("name")
+    except Exception:  # noqa: BLE001
+        return None
+    return name if isinstance(name, str) and name else None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -4876,7 +4908,8 @@ async def _session_get_info_via_rest(
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
     reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
+    parent linkage, workspace / git branch, first-class project id and
+    its resolved name, persisted last-activity time,
     and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
@@ -4920,9 +4953,11 @@ async def _session_get_info_via_rest(
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
-    runner_online, configured_harnesses = await asyncio.gather(
+    snap_project_id = _optional_string(snap.get("project_id"))
+    runner_online, configured_harnesses, project_name = await asyncio.gather(
         _runner_online_or_none(snap_runner_id, server_client),
         _host_harnesses_or_none(snap_host_id, server_client),
+        _project_name_or_none(snap_project_id, server_client),
     )
     return json.dumps(
         {
@@ -4952,6 +4987,14 @@ async def _session_get_info_via_rest(
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
+            # First-class Omnigent project this session is filed under
+            # (``None`` when unfiled), plus its resolved human-readable
+            # name (best-effort; ``None`` when unfiled or the project
+            # lookup failed). Lets an agent attribute work it does — e.g.
+            # tagging an external issue tracker — to the project the
+            # session belongs to without asking the user.
+            "project_id": snap_project_id,
+            "project_name": project_name,
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —
