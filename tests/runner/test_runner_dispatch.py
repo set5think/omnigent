@@ -8366,6 +8366,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "model_override": "claude-opus-4-8",
                     "workspace": "/repo",
                     "git_branch": "feature/x",
+                    "project_id": "proj_1",
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )
@@ -8375,6 +8376,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
             return httpx.Response(
                 200,
                 json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
+            )
+        if request.method == "GET" and request.url.path == "/v1/projects/proj_1":
+            return httpx.Response(
+                200,
+                json={"id": "proj_1", "object": "project", "name": "Home Automation"},
             )
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -8405,6 +8411,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         "codex-native": True,
         "cursor-native": False,
     }
+    # First-class project id passed through from the snapshot, plus its
+    # human-readable name resolved via GET /v1/projects/{id}. A None here
+    # would mean the passthrough or the best-effort name lookup regressed.
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] == "Home Automation"
     assert info["parent_session_id"] == "conv_parent"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
@@ -8476,6 +8487,76 @@ async def test_sys_session_get_info_reports_null_readiness_without_host() -> Non
 
     assert json.loads(output)["configured_harnesses"] is None
     assert host_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "project_response", [httpx.Response(404), httpx.Response(503), httpx.Response(200, text="x")]
+)
+async def test_sys_session_get_info_tolerates_project_lookup_failure(
+    project_response: httpx.Response,
+) -> None:
+    """
+    When the session is filed under a project but the name lookup fails
+    (not found / server error / non-JSON), ``sys_session_get_info`` still
+    passes through the raw ``project_id`` and degrades ``project_name`` to
+    ``None`` rather than erroring the whole call.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "project_id": "proj_1"})
+        if request.url.path == "/v1/projects/proj_1":
+            return project_response
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_skips_project_lookup_when_unfiled() -> None:
+    """A session with no project is reported with null id/name and makes no project GET."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    project_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "project_id": None})
+        if request.url.path.startswith("/v1/projects/"):
+            project_calls.append(request.url.path)
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["project_id"] is None
+    assert info["project_name"] is None
+    assert project_calls == []
 
 
 @pytest.mark.asyncio
