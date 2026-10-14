@@ -598,3 +598,67 @@ async def test_resolve_file_id_block_no_notice_without_source_metadata() -> None
     assert result is not None
     _, notice = result
     assert notice is None
+
+
+# ── CUSTOM PATCH (set5think fork, manifest #8): normalize backend-rejected
+# inbound image formats (webp/heic) to JPEG for the native-CLI path. ──────────
+
+def _img_data_uri(fmt: str, mime: str) -> str:
+    """Return a data URI for a small real image encoded as *fmt*."""
+    import base64 as _b64
+    import io as _io
+
+    from PIL import Image as _Image
+
+    buf = _io.BytesIO()
+    _Image.new("RGB", (320, 240), (90, 140, 200)).save(buf, fmt)
+    return f"data:{mime};base64,{_b64.b64encode(buf.getvalue()).decode()}"
+
+
+def test_webp_input_image_is_transcoded_to_jpeg() -> None:
+    """A WebP upload (CodeWhisperer rejects WebP) is delivered as JPEG."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    from omnigent.inner.native_attachments import _decode_attachment_block
+
+    block = {
+        "type": "input_image",
+        "image_url": _img_data_uri("WEBP", "image/webp"),
+        "filename": "IMG_2673.webp",
+    }
+    decoded = _decode_attachment_block(block)
+    assert decoded is not None
+    raw, filename = decoded
+    assert _Image.open(_io.BytesIO(raw)).format == "JPEG"
+    assert filename.endswith(".jpg")  # extension realigned to the real format
+
+
+def test_png_and_jpeg_input_images_pass_through_unchanged() -> None:
+    """Accepted formats are not transcoded (bytes + extension unchanged)."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    from omnigent.inner.native_attachments import _decode_attachment_block
+
+    for fmt, mime, ext in (("PNG", "image/png", ".png"), ("JPEG", "image/jpeg", ".jpg")):
+        block = {
+            "type": "input_image",
+            "image_url": _img_data_uri(fmt, mime),
+            "filename": f"keep{ext}",
+        }
+        decoded = _decode_attachment_block(block)
+        assert decoded is not None
+        raw, filename = decoded
+        assert _Image.open(_io.BytesIO(raw)).format == fmt
+        assert filename.endswith(ext)
+
+
+def test_normalize_native_cli_image_returns_none_for_accepted_formats() -> None:
+    """The normalizer is a no-op (None) for non-rejected MIME types."""
+    from omnigent.inner.native_attachments import _normalize_native_cli_image
+
+    assert _normalize_native_cli_image(b"whatever", "image/png") is None
+    assert _normalize_native_cli_image(b"whatever", "image/jpeg") is None

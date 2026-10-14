@@ -240,7 +240,20 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
         _logger.warning("Failed to decode data URI for attachment", exc_info=True)
         return None
 
-    ext = MIME_TO_EXT.get(parsed.mime_type, "")
+    mime_type = parsed.mime_type
+    # Normalize image formats the native-CLI backend rejects (CUSTOM PATCH,
+    # set5think fork -- see manifest entry #8). kiro-cli's CodeWhisperer backend
+    # rejects WebP (and HEIC/HEIF) images read into the model context with
+    # "[image removed: rejected by the model provider]", which blinds the agent
+    # to the user's photo and interrupts the turn. iPhone/Safari uploads are
+    # routinely WebP/HEIC, so transcode them to JPEG here -- the one place every
+    # inbound native-CLI image is materialized -- before the file lands on disk
+    # for the CLI to read. Best-effort: on any failure, keep the original bytes.
+    normalized = _normalize_native_cli_image(raw_bytes, mime_type)
+    if normalized is not None:
+        raw_bytes, mime_type = normalized
+
+    ext = MIME_TO_EXT.get(mime_type, "")
     filename = block.get("filename")
     if not isinstance(filename, str) or not filename:
         filename = f"attachment_{uuid.uuid4().hex[:8]}{ext}"
@@ -248,7 +261,66 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
         # ``.name`` drops any directory part, so "../../etc/passwd" becomes
         # "passwd" and a traversal attempt can't escape the destination dir.
         filename = Path(filename).name or f"attachment_{uuid.uuid4().hex[:8]}{ext}"
+        # If we transcoded, realign the extension so name/bytes/type agree and
+        # the CLI's Read tool sniffs it as the format we actually wrote.
+        if normalized is not None and ext:
+            filename = f"{Path(filename).stem}{ext}"
     return raw_bytes, _MARKER_UNSAFE.sub("_", filename)
+
+
+# Inbound image MIME types the native-CLI backend (CodeWhisperer, via kiro-cli)
+# rejects when read into the model context. Transcoded to JPEG before delivery.
+_NATIVE_CLI_REJECTED_IMAGE_MIMES: frozenset[str] = frozenset(
+    {"image/webp", "image/heic", "image/heif"}
+)
+
+
+def _normalize_native_cli_image(
+    raw_bytes: bytes, mime_type: str
+) -> tuple[bytes, str] | None:
+    """
+    Transcode a backend-rejected image format to JPEG for the native CLI.
+
+    kiro-cli's CodeWhisperer backend rejects WebP/HEIC/HEIF images read into
+    the model context, so the agent never sees the user's photo and the turn
+    is interrupted. This re-encodes those formats to JPEG -- which the backend
+    accepts -- at the single inbound materialization point.
+
+    :param raw_bytes: Decoded image bytes.
+    :param mime_type: The image's declared MIME type, e.g. ``"image/webp"``.
+    :returns: ``(jpeg_bytes, "image/jpeg")`` when a transcode happened, or
+        ``None`` to keep the original bytes (format not rejected, Pillow
+        missing, HEIC without pillow-heif, or any decode/encode failure).
+    """
+    if mime_type not in _NATIVE_CLI_REJECTED_IMAGE_MIMES:
+        return None
+    try:
+        import io
+
+        from PIL import Image, ImageOps
+    except Exception:  # noqa: BLE001 -- Pillow missing -> deliver original bytes
+        _logger.warning("Pillow unavailable; cannot normalize %s image", mime_type)
+        return None
+    if mime_type in ("image/heic", "image/heif"):
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+        except Exception:  # noqa: BLE001 -- no HEIC support -> deliver original
+            _logger.warning("pillow-heif unavailable; cannot normalize %s", mime_type)
+            return None
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            # Bound the longest edge: the backend also rejects very large
+            # images, and the model never needs more than this.
+            img.thumbnail((2048, 2048))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+    except Exception:  # noqa: BLE001 -- undecodable -> deliver original bytes
+        _logger.warning("Failed to transcode %s image to JPEG", mime_type, exc_info=True)
+        return None
+    return buf.getvalue(), "image/jpeg"
 
 
 def _place_no_follow(
