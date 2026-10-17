@@ -1,0 +1,59 @@
+spec_version: 1
+name: gpt-oss-pi
+description: >-
+  General-purpose gpt-oss-120b agent (via Bedrock) running under the Pi
+  harness, with filesystem + shell tools and the ability to spawn sub-agent
+  sessions. Pi-harness variant of `gpt-oss`: it drives the `pi` CLI in gateway
+  mode against the Bedrock OpenAI-compatible endpoint, so gpt-oss's reasoning
+  channel is handled by Pi's own agent loop instead of the openai-agents SDK —
+  which leaked raw Harmony `<reasoning>` channel tokens into message content
+  and crashed the turn (session 9fccb59943bb4c8998ddf0b34594a262).
+
+spawn: true
+
+# Headless Pi harness (omnigent.inner.pi_harness -> PiExecutor): the worker
+# runs the `pi` CLI behind the harness RPC contract, and its shell access
+# flows through the bridged sys_os_* tools, so every command passes the policy
+# layer. Pi requires the `pi` CLI on PATH (>= 0.84.2); the runtime workflow
+# layer (_build_pi_spawn_env) translates the top-level `auth` provider +
+# `model` below into Pi's gateway env (HARNESS_PI_GATEWAY_BASE_URL +
+# wire_api=chat + bearer auth command).
+#
+# NB: harness/model/auth are TOP-LEVEL executor keys (not nested under
+# `config:`). The pi spawn-env builder reads `executor.auth` / `executor.model`
+# directly — nesting them under `config:` leaves those fields None and Pi falls
+# back to its own /login (no credential). This mirrors the working deepseek /
+# gpt-oss specs.
+executor:
+  type: omnigent
+  model: openai.gpt-oss-120b-1:0
+  auth:
+    type: provider
+    name: bedrock-oss
+  config:
+    harness: pi
+
+# Register filesystem/shell tools (sys_os_read/write/edit/shell).
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Blast-radius guardrail: deny the catastrophic set, allow everything else
+# without an approval prompt (a headless agent cannot answer one).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
+prompt: |
+  You are a helpful, capable assistant running on gpt-oss-120b under the Pi
+  harness. You have filesystem and shell access via your sys_os_* tools — use
+  them to read, write, and run things when the task calls for it. Be concise
+  and get the job done.
