@@ -4967,6 +4967,12 @@ def create_runner_app(
         _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
+        try:
+            from omnigent.runner.relay_image_clamp import reset_session_image_count
+
+            reset_session_image_count(session_id)
+        except Exception:  # noqa: BLE001 — cleanup helper must never break teardown
+            pass
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -8299,7 +8305,7 @@ def create_runner_app(
             # and the omnigent-fork skill manifest.
             from omnigent.runner.relay_image_clamp import clamp_relay_result_images
 
-            return cast(_JsonObject, clamp_relay_result_images(parsed))
+            return cast(_JsonObject, clamp_relay_result_images(parsed, _captured_session_id))
 
         try:
             relay: ClaudeNativeToolRelay = start_tool_relay(
