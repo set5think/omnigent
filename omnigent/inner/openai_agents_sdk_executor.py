@@ -213,10 +213,37 @@ def _normalize_content_blocks_for_chat(
             changed = changed or sanitized != block
             result.append(sanitized)
         elif block_type == "input_image":
-            # Preserve inline images; strip Omnigent-only metadata.
-            sanitized = _copy_known_keys(block, ("type", "image_url", "file_id", "detail"))
-            changed = changed or sanitized != block
-            result.append(sanitized)
+            # The OpenAI Agents SDK requires input_image to carry an
+            # ``image_url`` (a URL or a ``data:<mime>;base64,...`` URI). A block
+            # that reached here with only a ``file_id`` is an UNRESOLVED
+            # reference — normally omnigent.runtime.content_resolver inlines
+            # file_id images to image_url before the model call, but a
+            # cross-session or since-deleted file can't be resolved and the raw
+            # file_id survives. Passing it through makes the SDK reject the whole
+            # turn ("Only image URLs are supported for input_image"), which has
+            # taken down vision sessions (e.g. house-helper decor flows). So:
+            # keep the block only when it has a usable image_url; otherwise drop
+            # it and leave a short placeholder so the turn still runs instead of
+            # failing hard. ``file_id`` is never forwarded to the SDK.
+            # CUSTOM PATCH (set5think fork) — see the omnigent-fork skill manifest.
+            image_url = block.get("image_url")
+            has_url = (
+                isinstance(image_url, str) and image_url.strip() != ""
+            ) or isinstance(image_url, dict)
+            if has_url:
+                sanitized = _copy_known_keys(block, ("type", "image_url", "detail"))
+                changed = changed or sanitized != block
+                result.append(sanitized)
+            else:
+                # Unresolved image reference — drop it (never forward file_id)
+                # and note it so the model has context for the gap.
+                changed = True
+                result.append(
+                    {
+                        "type": "input_text",
+                        "text": "[an image here could not be loaded and was omitted]",
+                    }
+                )
         else:
             result.append(block)
     # Return original list when nothing changed so callers can use
