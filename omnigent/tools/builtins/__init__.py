@@ -59,6 +59,7 @@ from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
     SysSessionCreateTool,
+    SysSessionPostTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
@@ -98,6 +99,7 @@ __all__ = [
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
     "SysSessionListTool",
+    "SysSessionPostTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",

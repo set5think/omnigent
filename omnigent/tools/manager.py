@@ -36,6 +36,7 @@ from omnigent.tools.builtins import (
     SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
+    SysSessionPostTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
@@ -461,6 +462,9 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        # CUSTOM PATCH (set5think fork, manifest #4): relationship-agnostic
+        # cross-session message post. Always-on, like the session reads.
+        self._tools[SysSessionPostTool.name()] = SysSessionPostTool()
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared
