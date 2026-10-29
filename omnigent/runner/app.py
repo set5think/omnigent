@@ -3481,6 +3481,15 @@ def create_runner_app(
         _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
+        # CUSTOM PATCH (set5think fork, manifest #1): clear this session's
+        # cumulative inline-image counter so the per-session image budget
+        # resets on teardown (the counter lives in relay_image_clamp).
+        try:
+            from omnigent.runner.relay_image_clamp import reset_session_image_count
+
+            reset_session_image_count(session_id)
+        except Exception:  # noqa: BLE001 — cleanup helper must never break teardown
+            pass
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -4752,10 +4761,21 @@ def create_runner_app(
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
             ).call_tool(relay_spec, name, arguments)
+            # CUSTOM PATCH (set5think fork, manifest #1): clamp inline images in
+            # the tool result before it reaches the native CLI. kiro-cli stores
+            # full-res base64 images and replays them every turn, tripping the
+            # backend's per-image size (5MB), aggregate-body, and inline-media
+            # COUNT (100) limits -> ValidationException wedges the session. The
+            # clamp downscales oversize images, caps images per result, and
+            # enforces a per-session cumulative image budget. See
+            # omnigent/runner/relay_image_clamp.py.
+            from omnigent.runner.relay_image_clamp import clamp_relay_result_images
+
             try:
-                return cast(_JsonObject, _json.loads(result_str))
+                parsed = cast(_JsonObject, _json.loads(result_str))
             except _json.JSONDecodeError:
                 return {"result": result_str}
+            return cast(_JsonObject, clamp_relay_result_images(parsed, _captured_session_id))
 
         async def _observe_native_file_changes(payload: _JsonObject) -> None:
             """Record native file-mutating tool calls in the session's registry.
